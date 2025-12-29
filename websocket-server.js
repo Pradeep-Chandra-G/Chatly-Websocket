@@ -1,10 +1,9 @@
+// FIXED WebSocket Server (websocket-server.js)
 const { createServer } = require("http");
 const { Server } = require("socket.io");
-const { MongoClient } = require("mongodb");
 
 const port = process.env.PORT || 3001;
 
-// Minimal HTTP server just for Socket.IO
 const server = createServer((req, res) => {
   res.writeHead(200);
   res.end("WebSocket Server Running");
@@ -20,9 +19,9 @@ const io = new Server(server, {
   pingInterval: 25000,
 });
 
-const userSockets = new Map();
+const userSockets = new Map(); // userId -> socketId
 const onlineUsers = new Set();
-const userConversations = new Map();
+const userConversations = new Map(); // userId -> Set of conversationIds
 
 io.on("connection", (socket) => {
   console.log("🔌 User connected:", socket.id);
@@ -38,10 +37,12 @@ io.on("connection", (socket) => {
       userConversations.set(userId, new Set());
     }
 
+    // Send initial online users list to the connecting user
     socket.emit("users:online-list", {
       onlineUsers: Array.from(onlineUsers),
     });
 
+    // Broadcast to others that this user is online
     socket.broadcast.emit("user:status", {
       userId,
       status: "online",
@@ -63,6 +64,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("conversation:join", (conversationId) => {
+    console.log(
+      `👥 User ${socket.userId} joined conversation ${conversationId}`
+    );
     socket.join(conversationId);
     if (socket.userId && userConversations.has(socket.userId)) {
       userConversations.get(socket.userId).add(conversationId);
@@ -70,36 +74,87 @@ io.on("connection", (socket) => {
   });
 
   socket.on("conversation:leave", (conversationId) => {
+    console.log(`👋 User ${socket.userId} left conversation ${conversationId}`);
     socket.leave(conversationId);
     if (socket.userId && userConversations.has(socket.userId)) {
       userConversations.get(socket.userId).delete(conversationId);
     }
   });
 
+  // NEW MESSAGE HANDLER - CRITICAL FIX
+  // SIMPLIFIED MESSAGE HANDLER
   socket.on("message:send", (data) => {
+    console.log(`📨 Message sent in conversation ${data.conversationId}`);
+
+    // Broadcast to everyone in the conversation room (people actively viewing it)
     io.to(data.conversationId).emit("message:new", data);
+
+    // **ALSO send to all participants' personal rooms**
+    // This ensures they get the notification even if not viewing the chat
+    if (data.participants && Array.isArray(data.participants)) {
+      data.participants.forEach((participantId) => {
+        // Emit to each participant's personal room
+        // The client will handle deduplication and proper status updates
+        io.to(participantId).emit("message:new", data);
+      });
+    }
+
+    // Check if anyone is viewing the conversation for delivery status
     const conversationSockets = io.sockets.adapter.rooms.get(
       data.conversationId
     );
-    if (conversationSockets && conversationSockets.size > 1) {
-      setTimeout(() => {
-        io.to(data.conversationId).emit("message:status", {
-          messageId: data._id,
-          status: "delivered",
-        });
-      }, 100);
+
+    if (conversationSockets) {
+      console.log(
+        `👥 Conversation has ${conversationSockets.size} active viewers`
+      );
+
+      // If more than just the sender is viewing (size > 1), mark as delivered
+      if (conversationSockets.size > 1) {
+        setTimeout(() => {
+          console.log(`✅ Message ${data._id} marked as delivered`);
+          io.to(data.conversationId).emit("message:status", {
+            messageId: data._id,
+            status: "delivered",
+          });
+        }, 100);
+      } else {
+        console.log(
+          `⏳ Only sender viewing, message ${data._id} stays as 'sent'`
+        );
+      }
     }
   });
 
+  // DELIVERED STATUS - User received message but hasn't opened chat
   socket.on("message:delivered", ({ messageId, conversationId }) => {
+    console.log(`✅ Message ${messageId} delivered`);
     io.to(conversationId).emit("message:status", {
       messageId,
       status: "delivered",
     });
   });
 
+  // READ STATUS - User opened chat and saw message
   socket.on("message:read", ({ messageId, conversationId }) => {
-    io.to(conversationId).emit("message:status", { messageId, status: "read" });
+    console.log(`👀 Message ${messageId} read`);
+    io.to(conversationId).emit("message:status", {
+      messageId,
+      status: "read",
+    });
+  });
+
+  // BULK READ - When user opens a conversation, mark all unread as read
+  socket.on("messages:mark-read", ({ messageIds, conversationId }) => {
+    console.log(
+      `👀 Marking ${messageIds.length} messages as read in ${conversationId}`
+    );
+    messageIds.forEach((messageId) => {
+      io.to(conversationId).emit("message:status", {
+        messageId,
+        status: "read",
+      });
+    });
   });
 
   socket.on(
@@ -177,6 +232,7 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     if (socket.userId) {
+      console.log(`❌ User ${socket.userId} disconnected`);
       userSockets.delete(socket.userId);
       onlineUsers.delete(socket.userId);
       userConversations.delete(socket.userId);
