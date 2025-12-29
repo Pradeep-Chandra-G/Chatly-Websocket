@@ -1,0 +1,16 @@
+{
+  "name": "chatly-websocket",
+  "version": "1.0.0",
+  "description": "WebSocket server for Chatly",
+  "main": "websocket-server.js",
+  "scripts": {
+    "start": "node websocket-server.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.0",
+    "mongodb": "^6.6.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
