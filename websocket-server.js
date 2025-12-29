@@ -114,6 +114,17 @@ io.on("connection", (socket) => {
     }
   );
 
+  socket.on(
+    "message:delete",
+    ({ messageId, conversationId, newLastMessage }) => {
+      io.to(conversationId).emit("message:deleted", {
+        messageId,
+        conversationId,
+        newLastMessage,
+      });
+    }
+  );
+
   socket.on("call:initiate", ({ callId, receiverId, type, offer }) => {
     const receiverSocket = userSockets.get(receiverId);
     if (receiverSocket) {
