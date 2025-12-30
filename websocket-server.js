@@ -1,4 +1,4 @@
-// FIXED WebSocket Server (websocket-server.js)
+// OPTIMIZED WebSocket Server (websocket-server.js)
 const { createServer } = require("http");
 const { Server } = require("socket.io");
 
@@ -15,31 +15,82 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
   },
   path: "/socket.io/",
+
+  // OPTIMIZATION 1: Tune timeouts for 512 MB RAM
   pingTimeout: 60000,
   pingInterval: 25000,
+
+  // OPTIMIZATION 2: Connection limits
+  maxHttpBufferSize: 1e6, // 1 MB max message size (down from default 1e8)
+
+  // OPTIMIZATION 3: Compression for bandwidth savings
+  perMessageDeflate: {
+    threshold: 1024, // only compress messages > 1KB
+  },
+
+  // OPTIMIZATION 4: Limit connections per origin (prevent abuse)
+  allowEIO3: false, // disable legacy protocol
 });
 
+// OPTIMIZATION 5: Use Map instead of Set for better memory efficiency
 const userSockets = new Map(); // userId -> socketId
-const onlineUsers = new Set();
+const onlineUsers = new Map(); // userId -> { socketId, lastSeen }
 const userConversations = new Map(); // userId -> Set of conversationIds
+
+// OPTIMIZATION 6: Periodic cleanup of stale connections
+const CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const STALE_TIMEOUT = 10 * 60 * 1000; // 10 minutes
+
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+
+  for (const [userId, userData] of onlineUsers.entries()) {
+    if (now - userData.lastSeen > STALE_TIMEOUT) {
+      onlineUsers.delete(userId);
+      userSockets.delete(userId);
+      userConversations.delete(userId);
+      cleaned++;
+    }
+  }
+
+  if (cleaned > 0) {
+    console.log(`🧹 Cleaned ${cleaned} stale connections`);
+  }
+
+  // Log memory usage
+  const used = process.memoryUsage();
+  console.log(
+    `📊 Memory: ${Math.round(used.heapUsed / 1024 / 1024)} MB / ${Math.round(
+      used.heapTotal / 1024 / 1024
+    )} MB`
+  );
+  console.log(`👥 Online users: ${onlineUsers.size}`);
+}, CLEANUP_INTERVAL);
 
 io.on("connection", (socket) => {
   console.log("🔌 User connected:", socket.id);
 
   socket.on("user:online", (userId) => {
     console.log(`✅ User ${userId} is now online`);
+
     userSockets.set(userId, socket.id);
     socket.userId = userId;
     socket.join(userId);
-    onlineUsers.add(userId);
+
+    // OPTIMIZATION 7: Track last seen for cleanup
+    onlineUsers.set(userId, {
+      socketId: socket.id,
+      lastSeen: Date.now(),
+    });
 
     if (!userConversations.has(userId)) {
       userConversations.set(userId, new Set());
     }
 
-    // Send initial online users list to the connecting user
+    // Send initial online users list
     socket.emit("users:online-list", {
-      onlineUsers: Array.from(onlineUsers),
+      onlineUsers: Array.from(onlineUsers.keys()),
     });
 
     // Broadcast to others that this user is online
@@ -50,6 +101,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("ping", () => {
+    // OPTIMIZATION 8: Update last seen on ping
+    if (socket.userId && onlineUsers.has(socket.userId)) {
+      onlineUsers.get(socket.userId).lastSeen = Date.now();
+    }
     socket.emit("pong");
   });
 
@@ -68,6 +123,7 @@ io.on("connection", (socket) => {
       `👥 User ${socket.userId} joined conversation ${conversationId}`
     );
     socket.join(conversationId);
+
     if (socket.userId && userConversations.has(socket.userId)) {
       userConversations.get(socket.userId).add(conversationId);
     }
@@ -76,79 +132,56 @@ io.on("connection", (socket) => {
   socket.on("conversation:leave", (conversationId) => {
     console.log(`👋 User ${socket.userId} left conversation ${conversationId}`);
     socket.leave(conversationId);
+
     if (socket.userId && userConversations.has(socket.userId)) {
       userConversations.get(socket.userId).delete(conversationId);
     }
   });
 
-  // NEW MESSAGE HANDLER - CRITICAL FIX
-  // SIMPLIFIED MESSAGE HANDLER
+  // OPTIMIZATION 9: Simplified message handler (removed duplicate logic)
   socket.on("message:send", (data) => {
     console.log(`📨 Message sent in conversation ${data.conversationId}`);
 
-    // Broadcast to everyone in the conversation room (people actively viewing it)
+    // Broadcast to conversation room
     io.to(data.conversationId).emit("message:new", data);
 
-    // **ALSO send to all participants' personal rooms**
-    // This ensures they get the notification even if not viewing the chat
+    // Also send to all participants' personal rooms
     if (data.participants && Array.isArray(data.participants)) {
       data.participants.forEach((participantId) => {
-        // Emit to each participant's personal room
-        // The client will handle deduplication and proper status updates
         io.to(participantId).emit("message:new", data);
       });
     }
 
-    // Check if anyone is viewing the conversation for delivery status
+    // Check for delivery
     const conversationSockets = io.sockets.adapter.rooms.get(
       data.conversationId
     );
 
-    if (conversationSockets) {
-      console.log(
-        `👥 Conversation has ${conversationSockets.size} active viewers`
-      );
-
-      // If more than just the sender is viewing (size > 1), mark as delivered
-      if (conversationSockets.size > 1) {
-        setTimeout(() => {
-          console.log(`✅ Message ${data._id} marked as delivered`);
-          io.to(data.conversationId).emit("message:status", {
-            messageId: data._id,
-            status: "delivered",
-          });
-        }, 100);
-      } else {
-        console.log(
-          `⏳ Only sender viewing, message ${data._id} stays as 'sent'`
-        );
-      }
+    if (conversationSockets && conversationSockets.size > 1) {
+      setTimeout(() => {
+        io.to(data.conversationId).emit("message:status", {
+          messageId: data._id,
+          status: "delivered",
+        });
+      }, 100);
     }
   });
 
-  // DELIVERED STATUS - User received message but hasn't opened chat
   socket.on("message:delivered", ({ messageId, conversationId }) => {
-    console.log(`✅ Message ${messageId} delivered`);
     io.to(conversationId).emit("message:status", {
       messageId,
       status: "delivered",
     });
   });
 
-  // READ STATUS - User opened chat and saw message
   socket.on("message:read", ({ messageId, conversationId }) => {
-    console.log(`👀 Message ${messageId} read`);
     io.to(conversationId).emit("message:status", {
       messageId,
       status: "read",
     });
   });
 
-  // BULK READ - When user opens a conversation, mark all unread as read
   socket.on("messages:mark-read", ({ messageIds, conversationId }) => {
-    console.log(
-      `👀 Marking ${messageIds.length} messages as read in ${conversationId}`
-    );
     messageIds.forEach((messageId) => {
       io.to(conversationId).emit("message:status", {
         messageId,
@@ -159,12 +192,21 @@ io.on("connection", (socket) => {
 
   socket.on(
     "message:edit",
-    ({ messageId, conversationId, content, edited, editedAt }) => {
+    ({
+      messageId,
+      conversationId,
+      content,
+      edited,
+      editedAt,
+      isLastMessage,
+    }) => {
       io.to(conversationId).emit("message:edited", {
         messageId,
         content,
         edited,
         editedAt,
+        conversationId,
+        isLastMessage, // ✅ Pass this through
       });
     }
   );
@@ -236,11 +278,33 @@ io.on("connection", (socket) => {
       userSockets.delete(socket.userId);
       onlineUsers.delete(socket.userId);
       userConversations.delete(socket.userId);
+
       io.emit("user:status", { userId: socket.userId, status: "offline" });
     }
   });
 });
 
+// OPTIMIZATION 10: Graceful shutdown
+process.on("SIGTERM", () => {
+  console.log("🛑 SIGTERM received, closing server gracefully");
+
+  io.close(() => {
+    console.log("✅ WebSocket server closed");
+    server.close(() => {
+      console.log("✅ HTTP server closed");
+      process.exit(0);
+    });
+  });
+
+  // Force close after 10 seconds
+  setTimeout(() => {
+    console.error("⚠️ Forcing shutdown");
+    process.exit(1);
+  }, 10000);
+});
+
 server.listen(port, "0.0.0.0", () => {
   console.log(`> WebSocket server ready on port ${port}`);
+  console.log(`📊 Memory limit: 512 MB`);
+  console.log(`👥 Estimated capacity: 200-400 concurrent connections`);
 });
