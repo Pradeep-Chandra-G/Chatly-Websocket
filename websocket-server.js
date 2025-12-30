@@ -138,26 +138,34 @@ io.on("connection", (socket) => {
     }
   });
 
-  // OPTIMIZATION 9: Simplified message handler (removed duplicate logic)
+  // OPTIMIZATION 9: Smart Message Handling
   socket.on("message:send", (data) => {
     console.log(`📨 Message sent in conversation ${data.conversationId}`);
 
-    // Broadcast to conversation room
+    // 1. Broadcast to the conversation room (Efficiently reaches everyone viewing the chat)
     io.to(data.conversationId).emit("message:new", data);
 
-    // Also send to all participants' personal rooms
+    // 2. Get a Set of all Socket IDs currently in this room
+    const roomSockets =
+      io.sockets.adapter.rooms.get(data.conversationId) || new Set();
+
+    // 3. Smartly notify others (unread markers/notifications)
     if (data.participants && Array.isArray(data.participants)) {
       data.participants.forEach((participantId) => {
-        io.to(participantId).emit("message:new", data);
+        const participantSocketId = userSockets.get(participantId);
+
+        // ONLY send if the user is online AND NOT currently in the room
+        // This prevents the "Double Send" while ensuring notification delivery
+        if (participantSocketId && !roomSockets.has(participantSocketId)) {
+          io.to(participantSocketId).emit("message:new", data);
+        }
       });
     }
 
-    // Check for delivery
-    const conversationSockets = io.sockets.adapter.rooms.get(
-      data.conversationId
-    );
-
-    if (conversationSockets && conversationSockets.size > 1) {
+    // Check for delivery (update status to delivered)
+    if (roomSockets.size > 0) {
+      // If anyone is in the room, it's delivered
+      // ... existing delivery status logic ...
       setTimeout(() => {
         io.to(data.conversationId).emit("message:status", {
           messageId: data._id,
