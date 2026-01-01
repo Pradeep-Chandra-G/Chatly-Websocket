@@ -1,4 +1,4 @@
-// OPTIMIZED WebSocket Server (websocket-server.js)
+// OPTIMIZED WebSocket Server (websocket-server-fixed.js)
 const { createServer } = require("http");
 const { Server } = require("socket.io");
 
@@ -145,27 +145,42 @@ io.on("connection", (socket) => {
     // 1. Broadcast to the conversation room (Efficiently reaches everyone viewing the chat)
     io.to(data.conversationId).emit("message:new", data);
 
-    // 2. Get a Set of all Socket IDs currently in this room
+    // 2. Determine Delivery Status (FIXED)
+    let isDelivered = false;
     const roomSockets =
       io.sockets.adapter.rooms.get(data.conversationId) || new Set();
 
-    // 3. Smartly notify others (unread markers/notifications)
+    // Check if any OTHER users are in the room
+    for (const socketId of roomSockets) {
+      if (socketId !== socket.id) {
+        isDelivered = true;
+        break;
+      }
+    }
+
+    // 3. Smartly notify others & check online status
     if (data.participants && Array.isArray(data.participants)) {
       data.participants.forEach((participantId) => {
+        if (participantId === socket.userId) return; // Skip self
+
         const participantSocketId = userSockets.get(participantId);
 
-        // ONLY send if the user is online AND NOT currently in the room
-        // This prevents the "Double Send" while ensuring notification delivery
-        if (participantSocketId && !roomSockets.has(participantSocketId)) {
-          io.to(participantSocketId).emit("message:new", data);
+        // If they are online, we consider it delivered to their device
+        if (participantSocketId) {
+          isDelivered = true;
+
+          // ONLY send notification if NOT currently in the room
+          // (If in room, they got it via 'io.to(conversationId)' above)
+          if (!roomSockets.has(participantSocketId)) {
+            io.to(participantSocketId).emit("message:new", data);
+          }
         }
       });
     }
 
     // Check for delivery (update status to delivered)
-    if (roomSockets.size > 0) {
-      // If anyone is in the room, it's delivered
-      // ... existing delivery status logic ...
+    // FIX: Only emit "delivered" if we actually found someone else online/in-room
+    if (isDelivered) {
       setTimeout(() => {
         io.to(data.conversationId).emit("message:status", {
           messageId: data._id,
@@ -283,11 +298,15 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     if (socket.userId) {
       console.log(`❌ User ${socket.userId} disconnected`);
+
+      // FIX: Emit last seen BEFORE cleanup
+      const lastSeen = Date.now();
+      io.emit("user:last-seen", { userId: socket.userId, lastSeen });
+      io.emit("user:status", { userId: socket.userId, status: "offline" });
+
       userSockets.delete(socket.userId);
       onlineUsers.delete(socket.userId);
       userConversations.delete(socket.userId);
-
-      io.emit("user:status", { userId: socket.userId, status: "offline" });
     }
   });
 });
