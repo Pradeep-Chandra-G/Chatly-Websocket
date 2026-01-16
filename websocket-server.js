@@ -1,4 +1,4 @@
-// OPTIMIZED WebSocket Server (websocket-server-fixed.js)
+// FIXED WebSocket Server (websocket-server-fixed.js)
 const { createServer } = require("http");
 const { Server } = require("socket.io");
 
@@ -15,31 +15,24 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
   },
   path: "/socket.io/",
-
-  // OPTIMIZATION 1: Tune timeouts for 512 MB RAM
   pingTimeout: 60000,
   pingInterval: 25000,
-
-  // OPTIMIZATION 2: Connection limits
-  maxHttpBufferSize: 1e6, // 1 MB max message size (down from default 1e8)
-
-  // OPTIMIZATION 3: Compression for bandwidth savings
+  maxHttpBufferSize: 1e6,
   perMessageDeflate: {
-    threshold: 1024, // only compress messages > 1KB
+    threshold: 1024,
   },
-
-  // OPTIMIZATION 4: Limit connections per origin (prevent abuse)
-  allowEIO3: false, // disable legacy protocol
+  allowEIO3: false,
 });
 
-// OPTIMIZATION 5: Use Map instead of Set for better memory efficiency
 const userSockets = new Map(); // userId -> socketId
 const onlineUsers = new Map(); // userId -> { socketId, lastSeen }
 const userConversations = new Map(); // userId -> Set of conversationIds
 
-// OPTIMIZATION 6: Periodic cleanup of stale connections
-const CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 minutes
-const STALE_TIMEOUT = 10 * 60 * 1000; // 10 minutes
+// ✅ NEW: Track pending messages for offline users
+const pendingDeliveries = new Map(); // conversationId -> Set of messageIds
+
+const CLEANUP_INTERVAL = 5 * 60 * 1000;
+const STALE_TIMEOUT = 10 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
@@ -58,7 +51,6 @@ setInterval(() => {
     console.log(`🧹 Cleaned ${cleaned} stale connections`);
   }
 
-  // Log memory usage
   const used = process.memoryUsage();
   console.log(
     `📊 Memory: ${Math.round(used.heapUsed / 1024 / 1024)} MB / ${Math.round(
@@ -78,7 +70,6 @@ io.on("connection", (socket) => {
     socket.userId = userId;
     socket.join(userId);
 
-    // OPTIMIZATION 7: Track last seen for cleanup
     onlineUsers.set(userId, {
       socketId: socket.id,
       lastSeen: Date.now(),
@@ -98,10 +89,12 @@ io.on("connection", (socket) => {
       userId,
       status: "online",
     });
+
+    // ✅ FIX: Process pending deliveries for this user
+    processPendingDeliveries(userId);
   });
 
   socket.on("ping", () => {
-    // OPTIMIZATION 8: Update last seen on ping
     if (socket.userId && onlineUsers.has(socket.userId)) {
       onlineUsers.get(socket.userId).lastSeen = Date.now();
     }
@@ -127,6 +120,9 @@ io.on("connection", (socket) => {
     if (socket.userId && userConversations.has(socket.userId)) {
       userConversations.get(socket.userId).add(conversationId);
     }
+
+    // ✅ FIX: Check for pending deliveries when joining conversation
+    checkPendingDeliveriesForConversation(conversationId, socket.userId);
   });
 
   socket.on("conversation:leave", (conversationId) => {
@@ -138,49 +134,58 @@ io.on("connection", (socket) => {
     }
   });
 
-  // OPTIMIZATION 9: Smart Message Handling
+  // ✅ FIXED: Message sending with proper delivery tracking
   socket.on("message:send", (data) => {
     console.log(`📨 Message sent in conversation ${data.conversationId}`);
 
-    // 1. Broadcast to the conversation room (Efficiently reaches everyone viewing the chat)
+    // 1. Broadcast to the conversation room
     io.to(data.conversationId).emit("message:new", data);
 
-    // 2. Determine Delivery Status (FIXED)
-    let isDelivered = false;
+    // 2. Initialize delivery tracking
+    let deliveredToAnyoneOnline = false;
     const roomSockets =
       io.sockets.adapter.rooms.get(data.conversationId) || new Set();
 
     // Check if any OTHER users are in the room
     for (const socketId of roomSockets) {
       if (socketId !== socket.id) {
-        isDelivered = true;
+        deliveredToAnyoneOnline = true;
         break;
       }
     }
 
-    // 3. Smartly notify others & check online status
+    // 3. Track which participants received the message
+    const deliveredToUsers = new Set();
     if (data.participants && Array.isArray(data.participants)) {
       data.participants.forEach((participantId) => {
-        if (participantId === socket.userId) return; // Skip self
+        if (participantId === socket.userId) return;
 
         const participantSocketId = userSockets.get(participantId);
 
-        // If they are online, we consider it delivered to their device
         if (participantSocketId) {
-          isDelivered = true;
+          deliveredToAnyoneOnline = true;
+          deliveredToUsers.add(participantId);
 
-          // ONLY send notification if NOT currently in the room
-          // (If in room, they got it via 'io.to(conversationId)' above)
+          // Send to user if not in room
           if (!roomSockets.has(participantSocketId)) {
             io.to(participantSocketId).emit("message:new", data);
           }
+        } else {
+          // ✅ FIX: Track pending delivery for offline users
+          if (!pendingDeliveries.has(data.conversationId)) {
+            pendingDeliveries.set(data.conversationId, new Map());
+          }
+          const convPending = pendingDeliveries.get(data.conversationId);
+          if (!convPending.has(data._id)) {
+            convPending.set(data._id, new Set());
+          }
+          convPending.get(data._id).add(participantId);
         }
       });
     }
 
-    // Check for delivery (update status to delivered)
-    // FIX: Only emit "delivered" if we actually found someone else online/in-room
-    if (isDelivered) {
+    // 4. Emit delivery status if anyone received it
+    if (deliveredToAnyoneOnline) {
       setTimeout(() => {
         io.to(data.conversationId).emit("message:status", {
           messageId: data._id,
@@ -211,6 +216,12 @@ io.on("connection", (socket) => {
         status: "read",
       });
     });
+
+    // ✅ NEW: Notify about unread count update
+    io.to(conversationId).emit("conversation:unread-updated", {
+      conversationId,
+      userId: socket.userId,
+    });
   });
 
   socket.on(
@@ -229,7 +240,7 @@ io.on("connection", (socket) => {
         edited,
         editedAt,
         conversationId,
-        isLastMessage, // ✅ Pass this through
+        isLastMessage,
       });
     }
   );
@@ -299,7 +310,6 @@ io.on("connection", (socket) => {
     if (socket.userId) {
       console.log(`❌ User ${socket.userId} disconnected`);
 
-      // FIX: Emit last seen BEFORE cleanup
       const lastSeen = Date.now();
       io.emit("user:last-seen", { userId: socket.userId, lastSeen });
       io.emit("user:status", { userId: socket.userId, status: "offline" });
@@ -311,7 +321,73 @@ io.on("connection", (socket) => {
   });
 });
 
-// OPTIMIZATION 10: Graceful shutdown
+// ✅ NEW: Process pending deliveries when user comes online
+function processPendingDeliveries(userId) {
+  for (const [conversationId, messages] of pendingDeliveries.entries()) {
+    const deliveredMessages = [];
+
+    for (const [messageId, pendingUsers] of messages.entries()) {
+      if (pendingUsers.has(userId)) {
+        pendingUsers.delete(userId);
+        deliveredMessages.push(messageId);
+
+        // If all users have received it, remove from pending
+        if (pendingUsers.size === 0) {
+          messages.delete(messageId);
+        }
+      }
+    }
+
+    // Emit delivery status for all pending messages
+    if (deliveredMessages.length > 0) {
+      deliveredMessages.forEach((messageId) => {
+        io.to(conversationId).emit("message:status", {
+          messageId,
+          status: "delivered",
+        });
+      });
+    }
+
+    // Clean up empty conversation entries
+    if (messages.size === 0) {
+      pendingDeliveries.delete(conversationId);
+    }
+  }
+}
+
+// ✅ NEW: Check pending deliveries for a specific conversation
+function checkPendingDeliveriesForConversation(conversationId, userId) {
+  if (!pendingDeliveries.has(conversationId)) return;
+
+  const messages = pendingDeliveries.get(conversationId);
+  const deliveredMessages = [];
+
+  for (const [messageId, pendingUsers] of messages.entries()) {
+    if (pendingUsers.has(userId)) {
+      pendingUsers.delete(userId);
+      deliveredMessages.push(messageId);
+
+      if (pendingUsers.size === 0) {
+        messages.delete(messageId);
+      }
+    }
+  }
+
+  if (deliveredMessages.length > 0) {
+    deliveredMessages.forEach((messageId) => {
+      io.to(conversationId).emit("message:status", {
+        messageId,
+        status: "delivered",
+      });
+    });
+  }
+
+  if (messages.size === 0) {
+    pendingDeliveries.delete(conversationId);
+  }
+}
+
+// Graceful shutdown
 process.on("SIGTERM", () => {
   console.log("🛑 SIGTERM received, closing server gracefully");
 
@@ -323,7 +399,6 @@ process.on("SIGTERM", () => {
     });
   });
 
-  // Force close after 10 seconds
   setTimeout(() => {
     console.error("⚠️ Forcing shutdown");
     process.exit(1);
